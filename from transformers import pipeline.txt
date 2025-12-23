@@ -1,0 +1,141 @@
+from transformers import pipeline
+import re
+
+# Helper to split a long task string into granular tasks
+def split_granular_tasks(text: str) -> list[str]:
+    # Patterns to aggressively split a single task string into multiple
+    # prioritizing time markers and conjunctions that introduce new actions.
+    # The order of patterns matters for more specific splits first.
+    split_patterns = [
+        r'\s*and at\s+',        # " and at "
+        r'\s*and during the day\s+', # " and during the day "
+        r'\s*and at evening\s+',# " and at evening "
+        r'\s*and at night\s+',  # " and at night "
+        r'\s+then\s+',          # " then "
+        r'\s+after that\s+',    # " after that "
+        r'\s*,\s*and\s+',       # ", and "
+        r'\s+and\s+(?=(?:I|we|he|she|they|you|to|a|some|an|my|the|go|take|leave|buy)\b)', # " and " followed by common task starters
+        r'\b(?:\d{1,2}(?::\d{2})?\s*(?:a\\.?m\\.?|p\\.?m\\.?))\b', # Time markers like "10 am", "3pm"
+        r'\.\s+|\?\s+|!\s+'     # Sentence enders (least priority if others worked)
+    ]
+
+    parts = [text.strip()]
+    for pattern in split_patterns:
+        new_parts = []
+        for part in parts:
+            if not part: continue
+            sub_parts = [p.strip() for p in re.split(pattern, part, flags=re.IGNORECASE) if p.strip()]
+            new_parts.extend(sub_parts)
+        parts = new_parts
+    return parts
+
+# -------------------------
+# MODEL / PIPELINE SETUP
+# -------------------------
+# Keep the same model family you used originally. Change to "google/flan-t5-large"
+# only if you intentionally want a bigger model and your runtime has enough RAM.
+MODEL_NAME = "google/flan-t5-base"
+
+task_summarizer = pipeline(
+    "text2text-generation",
+    model=MODEL_NAME,
+    tokenizer=MODEL_NAME,
+    device=0 if __import__("torch").cuda.is_available() else -1  # use GPU in Colab if available
+)
+
+# ==========================
+# SMART TASK EXTRACTOR
+# ==========================
+def extract_tasks(conversation: str):
+    """
+    Extracts actionable tasks from a conversation using the text2text-generation pipeline.
+    Returns a cleaned list of task strings.
+    """
+    prompt = (
+        "Analyze the following conversation carefully. Identify and extract all actionable tasks, goals, or objectives "
+        "that each participant mentions, implies, or commits to doing — whether personal or work-related. "
+        "Include even small tasks like errands, reminders, or meetings.\n\n"
+        "Format your answer as a bullet list, one task per line, and keep the speaker's name if mentioned.\n\n"
+        f"Conversation:\n{conversation}"
+    )
+
+    # run the model
+    raw_result = task_summarizer(prompt, max_length=200, min_length=30, do_sample=False)
+
+    # pipeline returns a list of dicts. Handle both possible keys safely.
+    if isinstance(raw_result, list) and len(raw_result) > 0:
+        first = raw_result[0]
+        # newer transformers typically return 'generated_text'
+        model_text = first.get("generated_text") or first.get("summary_text") or str(first)
+    else:
+        model_text = str(raw_result)
+
+    # convert model output into a clean list of lines
+    def clean_to_list(summary_text: str):
+        raw_lines = re.split(r'\n+|[•\-\*]\s*', summary_text.strip())
+        cleaned = []
+        seen = set()
+        for line in raw_lines:
+            if not line.strip(): continue
+            # Use the granular splitter to break down potentially long lines
+            granular_tasks = split_granular_tasks(line)
+            for s in granular_tasks:
+                s = s.strip(" -•\n\r\t")
+                if not s:
+                    continue
+                key = s.lower()
+                if key not in seen:
+                    seen.add(key)
+                    cleaned.append(s)
+        return cleaned
+
+    return clean_to_list(model_text)
+
+
+# --------------------------
+# Recall enhancer (regex)
+# --------------------------
+def enhance_task_recall(conversation: str, summarizer_tasks: list):
+    """
+    Finds additional potential tasks missed by the summarizer using regex patterns.
+    Appends new tasks (if any) to summarizer_tasks and returns the list.
+    """
+    # Patterns to catch common task-phrases
+    patterns = [
+        r'\b(?:I|We)\s+(?:need|have|must|should|plan|intend|will|am going to|ought|gotta|want|aim|hope|try)\s+to\s+([^\.!?]+)',
+        r'\b(?:remind\s+me\s+to|don\'t\s+forget\s+to|don\'t forget to)\s+([^\.!?]+)',
+        r'\b(?:I\'ll|I will|I\'m going to|I am going to)\s+([^\.!?]+)'
+    ]
+
+    found_temp = []
+    for pat in patterns:
+        matches = re.findall(pat, conversation, flags=re.IGNORECASE)
+        for m in matches:
+            # Split the found long phrase into granular tasks
+            granular_m_tasks = split_granular_tasks(m)
+            found_temp.extend(granular_m_tasks)
+
+    # Add unique ones not already present
+    existing = {s.lower() for s in summarizer_tasks} # Use a set for faster lookup
+    for t in found_temp:
+        t_clean = t[0].upper() + t[1:] if t else t # Capitalize first char
+        if t_clean and t_clean.lower() not in existing:
+            summarizer_tasks.append(t_clean)
+            existing.add(t_clean.lower()) # Add to existing set immediately
+
+    return summarizer_tasks
+
+
+# -------------------------
+# Example conversation and run
+# -------------------------
+conversation = """tomorrow morning at 10 a.m. I have to wake up at 11 noon I have to go college 3 p.m. I have to take a meeting and at 7 o'clock evening I have to go gym"
+"""
+
+if __name__ == "__main__":
+    tasks = extract_tasks(conversation)
+    tasks = enhance_task_recall(conversation, tasks)
+
+    # print clean numbered list
+    for i, task in enumerate(tasks, 1):
+        print(f"{i}. {task}")
